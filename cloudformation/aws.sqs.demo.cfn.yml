@@ -1,0 +1,301 @@
+################################################################################
+#
+# Cloud formation template
+# Author: NGUYEN Daniel
+# - Creation of the EC2 Instance hosting the source code by retrieval from S3
+# - Creation of SQS Queue + SNS Topic + SQS Subscription to the SNS Topic
+#
+################################################################################
+
+Parameters:
+
+  VPC:
+    Description: VPC to create the security group and EC2 instance into
+    Type: AWS::EC2::VPC::Id
+  SSHFrom:
+    Description: Limit SSH access to bastion hosts to a CIDR IP block
+    Type: String
+    MinLength: 9
+    MaxLength: 18
+    Default: 0.0.0.0/0
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: 'EC2 Tutorial'
+    Description: KeyName
+  S3BucketCodeSourceZip:
+    Type: String
+    Default: 'com.dnl.cfn'
+    Description: S3 Bucket where the Code Source Zip is stored
+  S3NameCodeSourceZip:
+    Type: String
+    Default: 'AWS.SQS.Demo.zip'
+    Description: Name of the Code Source Zip
+  SNSTopicNameParam:
+    Type: String
+    Default: MyAWSSQSDemoTopic
+    Description: SNS Topic Name
+  ReceiveMessageWaitTimeSeconds:
+    Type: Number
+    Description: >-
+      Specifies the duration, in seconds, that the ReceiveMessage action call
+      waits until a message is in the queue in order to include it in the
+      response, as opposed to returning an empty response if a message is not
+      yet available. 1 to 20
+    Default: '20'
+  VisibilityTimeout:
+    Type: Number
+    Description: >-
+      This should be longer than the time it would take to process and delete a
+      message, this should not exceed 12 hours.
+    Default: '60'
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "EC2 Configuration to host source code"
+        Parameters:
+          - VPC
+          - SSHFrom
+          - KeyName
+      -
+        Label:
+          default: "S3 Configuration where source code artifact is stored"
+        Parameters:
+          - S3BucketCodeSourceZip
+          - S3NameCodeSourceZip
+      -
+        Label:
+          default: "SNS Configuration"
+        Parameters:
+          - SNSTopicNameParam
+      -
+        Label:
+          default: "SQS Configuration"
+        Parameters:
+          - ReceiveMessageWaitTimeSeconds
+          - VisibilityTimeout
+
+
+Mappings:
+  AWSRegionArch2AMI:
+    eu-west-3:
+      HVM64: ami-0ebc281c20e89ba4b
+
+
+Resources:
+
+  SSHSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: !Sub SSH Security group for ${AWS::StackName}
+      SecurityGroupIngress:
+        - CidrIp: !Ref SSHFrom
+          FromPort: 22
+          ToPort: 22
+          IpProtocol: tcp
+          Description: SSH for SSHFrom source
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-SSHSecurityGroup"
+
+  DefaultSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: !Sub Default Security group for ${AWS::StackName}
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-DefaultSecurityGroup"
+
+  EC2RoleInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - !Ref EC2Role
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-EC2RoleName"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: my-policy-name
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:ListBucket
+            Resource:
+            - !Sub "arn:aws:s3:::${S3BucketCodeSourceZip}"
+            - !Sub "arn:aws:s3:::${S3BucketCodeSourceZip}/*"
+          - Effect: Allow
+            Action:
+            - sqs:*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - sns:Publish
+            Resource: !Ref SNSTopic
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      # Note we use the pseudo parameter AWS::Region
+      ImageId: !FindInMap [AWSRegionArch2AMI, !Ref 'AWS::Region', HVM64]
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      KeyName: !Ref 'KeyName'
+      SecurityGroupIds:
+        - !GetAtt SSHSecurityGroup.GroupId
+        - !GetAtt DefaultSecurityGroup.GroupId
+      IamInstanceProfile: !Ref 'EC2RoleInstanceProfile'
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -xe
+            yum update -y
+            cat > /tmp/subscript.sh << EOF
+            # START
+            echo "Setting up NodeJS Environment"
+            curl https://raw.githubusercontent.com/nvm-sh/nvm/v0.34.0/install.sh | bash
+
+            echo 'export NVM_DIR="/home/ec2-user/.nvm"' >> /home/ec2-user/.bashrc
+            echo '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"  # This loads nvm' >> /home/ec2-user/.bashrc
+
+            # Dot source the files to ensure that variables are available within the current shell
+            . /home/ec2-user/.nvm/nvm.sh
+            . /home/ec2-user/.bashrc
+
+            # Install NVM, NPM, Node.JS & Grunt
+            nvm alias default v12.7.0
+            nvm install v12.7.0
+            nvm use v12.7.0
+
+            aws s3 sync s3://${S3BucketCodeSourceZip} /home/ec2-user/app/ # can also do wget of zip file here
+            cd /home/ec2-user/app
+            unzip ${S3NameCodeSourceZip}
+            npm install
+            EOF
+
+            chown ec2-user:ec2-user /tmp/subscript.sh && chmod a+x /tmp/subscript.sh
+            sleep 1; su - ec2-user -c "/tmp/subscript.sh"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-EC2Instance"
+
+  ##### Creation of SQS Queue + SNS Topic + SQS Subscription to the SNS Topic ####
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Ref SNSTopicNameParam
+      DisplayName: !Ref SNSTopicNameParam
+      Subscription:
+        - Endpoint:
+            "Fn::GetAtt":
+              - SQSQueue
+              - Arn
+          Protocol: sqs
+
+  SQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-SQSQueue"
+      ReceiveMessageWaitTimeSeconds: !Ref ReceiveMessageWaitTimeSeconds
+      VisibilityTimeout: !Ref VisibilityTimeout
+
+  AllowSNS2SQSPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Allow-SNS-SendMessage
+            Effect: Allow
+            Principal: '*'
+            Action: ['sqs:SendMessage']
+            Resource:
+              !GetAtt SQSQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref SNSTopic
+      Queues:
+        - Ref: SQSQueue
+
+  SNSTargetArnParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/SQS_DEMO/SNS/TARGET_ARN"
+      Type: "String"
+      Value: !Ref SNSTopic
+      Description: "SSM Parameter for SNS Arn"
+
+  SQSQueueUrlParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/SQS_DEMO/SQS/QUEUE_URL"
+      Type: "String"
+      Value: !Ref SQSQueue
+      Description: "SSM Parameter for SQS Queue Url"
+
+Outputs:
+  OutputEC2Instance:
+    Description: The EC2 Instance ID
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub ${AWS::StackName}-EC2Instance
+  OutputSSHSecurityGroup:
+    Description: The EC2 Default Security Group
+    Value: !Ref SSHSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-SSHSecurityGroup
+  OutputDefaultSecurityGroup:
+    Description: The EC2 Default Security Group
+    Value: !Ref DefaultSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-DefaultSecurityGroup
+  OutputAllowSNS2SQSPolicy:
+    Description: The SQS Queue Policy
+    Value: !Ref AllowSNS2SQSPolicy
+  OutputSNSTopic:
+    Description: The SNS Topic
+    Value: !Ref SNSTopic
+  OutputQueueURL:
+    Description: URL of newly created SQS Queue
+    Value: !Ref SQSQueue
+  OutputQueueARN:
+    Description: ARN of newly created SQS Queue
+    Value: !GetAtt SQSQueue.Arn
+  OutputQueueName:
+    Description: Name of newly created SQS Queue
+    Value: !GetAtt SQSQueue.QueueName
+  OutputSNSTargetArnParameter:
+    Description: The SM Parameter for SNS Arn
+    Value: !Ref SNSTargetArnParameter
+  OutputSNSTargetArnParameterValue:
+    Description: The SM Parameter for SNS Arn
+    Value: !GetAtt SNSTargetArnParameter.Value
+  OutputSQSQueueUrlParameter:
+    Description: The SSM Parameter for SQS Queue Url
+    Value: !Ref SQSQueueUrlParameter
+  OutputSQSQueueUrlParameterValue:
+    Description: The SSM Parameter for SQS Queue Url
+    Value: !GetAtt SQSQueueUrlParameter.Value

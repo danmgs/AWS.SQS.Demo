@@ -1,0 +1,14 @@
+[
+  {
+    "ParameterKey": "VPC",
+    "ParameterValue": "vpc-xxxxxxxx"
+  },
+  {
+    "ParameterKey": "S3BucketCodeSourceZip",
+    "ParameterValue": "com.dnl.cfn"
+  },
+  {
+    "ParameterKey": "S3NameCodeSourceZip",
+    "ParameterValue": "AWS.SQS.Demo.zip"
+  }
+]
