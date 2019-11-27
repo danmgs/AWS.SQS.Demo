@@ -1,6 +1,6 @@
 # AWS . SQS . DEMO
 
-An AWS Lambda Worker that is triggered by SNS Topic in order to index message to an Elastic Search Service.
+A project to demo AWS SQS + SNS.
 
 ## <span style="color:green">Useful links</span>
 
